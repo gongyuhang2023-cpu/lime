@@ -61,7 +61,9 @@ export async function loadModel(op?: {
 		path.join(__dirname, "../Qwen3-0.6B-GGUF/Qwen3-0.6B-IQ4_XS.gguf");
 
 	const llama = await getLlama({
-		gpu: false,
+		// LIME_GPU=1 时交给 node-llama-cpp 自动选后端（cuda/vulkan）
+		// 不设则维持上游默认的纯 CPU 推理，行为不变
+		gpu: Deno.env.get("LIME_GPU") ? "auto" : false,
 	});
 
 	console.log("加载模型", modelPath);
