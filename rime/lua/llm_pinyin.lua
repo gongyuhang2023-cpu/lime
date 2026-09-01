@@ -46,10 +46,13 @@ local function request(path, body)
     headers.Authorization = "Bearer " .. key
   end
 
+  -- 输入法宁可这一键没有候选，也不能卡住用户正在打字的那个程序。
+  -- 后端正常出候选约 100ms，1 秒到不了就当它挂了，直接放弃这一次。
   local code, reply = fetch_text(base_url .. path, {
     headers = headers,
     method = "POST",
-    source = source
+    source = source,
+    timeout = 1
   })
 
   if enable_hiae and reply then

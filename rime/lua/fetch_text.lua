@@ -17,9 +17,15 @@ end
 ---@return integer? status_code HTTP状态码，失败时为nil
 ---@return string|nil response_body 响应体字符串，失败时为错误信息
 local function fetch_text(url, op)
-    -- 构建 curl 命令
-    local command = string.format("curl -s -w '\n%%{http_code}' --request %s --url %s",
-        shell_quote(op.method or "GET"), shell_quote(url))
+    -- 超时是必须的，不是可选项：
+    -- 输入法是 TSF 服务，会被加载进每一个应用程序的进程里，下面的 io.popen +
+    -- read("*a") 是同步阻塞调用，直接卡住当前应用的 UI 线程。后端一慢（比如模型
+    -- 正在加载）而 curl 又不设超时，表现就是整台机器像死机一样敲不进字。
+    -- 原来的代码声明了 op.timeout 却从没用过，实测导致过必须重启。
+    local timeout = op.timeout or 2
+    local command = string.format(
+        "curl -s --connect-timeout 1 --max-time %s -w '\n%%{http_code}' --request %s --url %s",
+        shell_quote(timeout), shell_quote(op.method or "GET"), shell_quote(url))
 
     -- 添加 headers
     if op.headers then
