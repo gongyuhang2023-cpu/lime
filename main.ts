@@ -119,6 +119,15 @@ export class LIME {
 	private userTokensFirstIndex = new Map<Token, Set<ExToken>>();
 	/** 已登记用户词的 token 序列，用于去重 */
 	private userWordKeys = new Set<string>();
+	/**
+	 * 「用户亲自确认过」的那部分用户词，只有它们享受同长度优先。
+	 *
+	 * 优先权之所以有用，正因为它稀缺。实测灌 20000 个通用词并全部给优先权，
+	 * 总选择成本从 364 涨到 563 —— 比完全不加词库还差，因为一堆同音无关词
+	 * 被抬到了模型的正确猜测之前。同一批测试里 79 个手挑领域词是 201。
+	 * 所以批量导入的词只提供「候选里有」，不提供「排在前面」。
+	 */
+	private vouchedTokens = new Set<ExToken>();
 	private tokenIndex = 0;
 
 	/**
@@ -344,6 +353,7 @@ export class LIME {
 		this.last_context_data.context = "";
 		this.userTokens.clear();
 		this.userWordKeys.clear();
+		this.vouchedTokens.clear();
 		await this.sequence.clearHistory();
 		await this.init_ctx();
 	};
@@ -391,9 +401,14 @@ export class LIME {
 	 * 把一个虚拟 token 注册进各张索引。addUserWord 与 loadUserData 共用：
 	 * 只往 userTokens 里塞映射是不够的，不建拼音索引的话这个词永远不会进候选集。
 	 */
-	private registerUserToken = (token_id: ExToken, ts: Array<Token>) => {
+	private registerUserToken = (
+		token_id: ExToken,
+		ts: Array<Token>,
+		vouched = true,
+	) => {
 		this.userTokens.set(token_id, ts);
 		this.userWordKeys.add(ts.join(","));
+		if (vouched) this.vouchedTokens.add(token_id);
 
 		const findex = this.userTokensFirstIndex.get(ts[0]) ?? new Set();
 		findex.add(token_id);
@@ -413,7 +428,11 @@ export class LIME {
 		}
 	};
 
-	addUserWord = (w: string) => {
+	/**
+	 * @param vouched 用户是否亲自确认过这个词。默认 true（亲自加的、从输入里
+	 * 学到的）。批量导入通用词库时务必传 false —— 见 vouchedTokens 的说明。
+	 */
+	addUserWord = (w: string, vouched = true) => {
 		const ts = this.model.tokenizer(w);
 		if (ts.length === 0) return false;
 
@@ -421,7 +440,7 @@ export class LIME {
 		// 虚拟 token，候选里就会出现两个一模一样的词。这里按 token 序列兜底。
 		if (this.userWordKeys.has(ts.join(","))) return false;
 
-		this.registerUserToken(this.tokenIndex++, ts);
+		this.registerUserToken(this.tokenIndex++, ts, vouched);
 
 		return true;
 	};
@@ -708,7 +727,7 @@ export class LIME {
 					token_pinyin.map((v) => v.preeditShow).join(" ") +
 					(rmpy.length ? " " : ""),
 				consumedkeys: token_pinyin.map((v) => v.key).join("").length,
-				userWord: this.userTokens.has(token_id),
+				userWord: this.vouchedTokens.has(token_id),
 			});
 		}
 

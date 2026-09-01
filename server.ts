@@ -119,6 +119,8 @@ try {
 		.filter((w) => w.trim());
 	const textEncoder = new TextEncoder();
 	for (const [i, w] of words.entries()) {
+		// userWordsPath 存的是本人加过 / 从输入里学到的词，给优先权。
+		// 批量导入的通用词库走 LIME_BULK_WORDS，不给优先权（见 vouchedTokens）。
 		addUserWord(w);
 		Deno.stdout.writeSync(
 			textEncoder.encode(
@@ -129,6 +131,22 @@ try {
 	console.log(`\n加载用户词完成，数量 ${words.length}`);
 } catch {
 	//
+}
+
+// 批量通用词库（可选）：只让这些词出现在候选里，不给同长度优先。
+// 实测把两万通用词也当成「用户亲自确认」来抬权重，总选择成本反而从 364
+// 涨到 563，比不加词库还差 —— 优先权稀缺才有用。
+const bulkPath = Deno.env.get("LIME_BULK_WORDS");
+if (bulkPath) {
+	try {
+		let n = 0;
+		for (const w of Deno.readTextFileSync(bulkPath).split("\n")) {
+			if (w.trim() && addUserWord(w.trim(), false)) n++;
+		}
+		console.log(`加载批量词库完成，数量 ${n}`);
+	} catch (e) {
+		console.error("批量词库加载失败:", e);
+	}
 }
 
 const app = new Hono();

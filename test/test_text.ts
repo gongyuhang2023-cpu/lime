@@ -53,16 +53,21 @@ async function run() {
 		...(modelPath ? { modelPath } : {}),
 	});
 
-	// LIME_BENCH_USERWORDS：一行一个词，用于评测「预置领域词库」的效果
-	const userWordsFile = Deno.env.get("LIME_BENCH_USERWORDS");
-	if (userWordsFile) {
-		const ws = Deno.readTextFileSync(userWordsFile)
+	// LIME_BENCH_USERWORDS：用户亲自确认的词（享受同长度优先）
+	// LIME_BENCH_BULKWORDS：批量导入的通用词库（只提供候选可得性，不给优先权）
+	for (const [envName, vouched] of [
+		["LIME_BENCH_BULKWORDS", false],
+		["LIME_BENCH_USERWORDS", true],
+	] as const) {
+		const f = Deno.env.get(envName);
+		if (!f) continue;
+		const ws = Deno.readTextFileSync(f)
 			.split("\n")
 			.map((w) => w.trim())
 			.filter(Boolean);
 		let ok = 0;
-		for (const w of ws) if (addUserWord(w)) ok++;
-		console.log(`预置用户词 ${ok}/${ws.length}`);
+		for (const w of ws) if (addUserWord(w, vouched)) ok++;
+		console.log(`${envName} 装入 ${ok}/${ws.length}（优先=${vouched}）`);
 	}
 
 	const file =
