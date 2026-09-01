@@ -45,9 +45,17 @@ function logOffset(offset: Record<number, number>) {
 }
 
 async function run() {
-	const { commit, single_ci } = await initLIME({ ziInd: load_pinyin() });
+	// LIME_BENCH_MODEL / LIME_BENCH_TEXT 用于横向对比不同模型、不同语料
+	// 都不设时行为与上游一致（默认模型 + 冰灯.txt）
+	const modelPath = Deno.env.get("LIME_BENCH_MODEL");
+	const { commit, single_ci } = await initLIME({
+		ziInd: load_pinyin(),
+		...(modelPath ? { modelPath } : {}),
+	});
 
-	const file = path.join(__dirname, "冰灯.txt");
+	const file =
+		Deno.env.get("LIME_BENCH_TEXT") ?? path.join(__dirname, "冰灯.txt");
+	console.log("评测语料", file, "模型", modelPath ?? "(默认)");
 
 	const seg = new Intl.Segmenter("zh-Hans", { granularity: "word" });
 	const test_text_raw = Deno.readTextFileSync(file);
