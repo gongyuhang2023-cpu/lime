@@ -24,7 +24,37 @@ try {
 
 const config = userConfig || (await import("./config.ts")).default;
 
-const { single_ci, commit, getUserData, addUserWord } = config.runner;
+const { single_ci, commit, getUserData, addUserWord, checkAddUserWord } =
+	config.runner;
+
+// ---- 生词记录 ----
+// 上游没有任何落盘，重启即失忆（README「现状」明说）。这里补上：
+// 同一个词被选够 LIME_LEARN_AFTER 次才收录，避免把每次选择都写成用户词。
+// 写的就是启动时读的那个 config.userWordsPath，闭环之后重启不再丢。
+const LEARN_AFTER = Number(Deno.env.get("LIME_LEARN_AFTER")) || 3;
+const LEARN_MAX_LEN = Number(Deno.env.get("LIME_LEARN_MAX_LEN")) || 12;
+const commitCount = new Map<string, number>();
+/** 本进程已处理过的词，避免重复查验和重复写盘 */
+const learnDone = new Set<string>();
+
+async function learnFromCommit(text: string) {
+	if (!text || text.length > LEARN_MAX_LEN || learnDone.has(text)) return;
+	const n = (commitCount.get(text) ?? 0) + 1;
+	commitCount.set(text, n);
+	if (n < LEARN_AFTER) return;
+
+	learnDone.add(text);
+	// addUserWord 内部按 token 序列去重，启动时已加载的词会返回 false
+	if (!(await checkAddUserWord(text)) || !addUserWord(text)) return;
+	try {
+		await Deno.writeTextFile(config.userWordsPath, `${text}\n`, {
+			append: true,
+		});
+		console.log(`记录生词「${text}」（被选 ${n} 次）`);
+	} catch (e) {
+		console.error("生词落盘失败:", e);
+	}
+}
 
 function arrayLimtPush<T>(arr: T[], item: T, maxLen: number) {
 	arr.push(item);
@@ -181,6 +211,7 @@ api.post("/commit", async (c) => {
 			inputLog.lastKeyTime = null;
 			inputLog.ziCount += text.length;
 			inputLog.history += text;
+			await learnFromCommit(text);
 		}
 		{
 			const offset = inputLog.lastCandidates.candidates.indexOf(newT ?? "");
