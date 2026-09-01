@@ -29,6 +29,24 @@ if (Deno.args[0] === "rime") {
 		const value = Number(w.split("\t")[2]?.trim() || "0");
 		if (word && value > 5000) words.push(word);
 	}
+} else if (Deno.args[0] === "text") {
+	// 从一份中文语料里提取高频多字词，配合 LIME_RECORD 记下来的真实输入使用：
+	//   deno run -A userword/preload_word.ts text <语料.txt> [最少出现次数,默认2]
+	// 基准实测「补领域词库」是收益最大的一项，而记录下来的真实用词比手写的准。
+	const p = Deno.args[1];
+	const minCount = Number(Deno.args[2]) || 2;
+	const raw = Deno.readTextFileSync(p);
+	const seg = new Intl.Segmenter("zh-Hans", { granularity: "word" });
+	const freq = new Map<string, number>();
+	for (const t of seg.segment(raw)) {
+		const w = t.segment.trim();
+		// 只要纯汉字的多字词：单字模型自己会预测，标点数字英文不进词库
+		if (!t.isWordLike || w.length < 2 || !/^[一-鿿]+$/.test(w)) continue;
+		freq.set(w, (freq.get(w) ?? 0) + 1);
+	}
+	for (const [w, n] of freq) if (n >= minCount) words.push(w);
+	words.sort((a, b) => (freq.get(b) ?? 0) - (freq.get(a) ?? 0));
+	console.log(`从语料提取到 ${words.length} 个词（出现 >=${minCount} 次）`);
 }
 
 const oldWords = new Set<string>();

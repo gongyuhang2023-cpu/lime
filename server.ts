@@ -37,6 +37,28 @@ const commitCount = new Map<string, number>();
 /** 本进程已处理过的词，避免重复查验和重复写盘 */
 const learnDone = new Set<string>();
 
+// ---- 输入记录 ----
+// LIME_RECORD=<路径> 开启：把上屏文本追加落盘，用于日后扩充词库、
+// 生成真实评测语料（Claude 编的语料对 LLM 偏可预测，基线数字会偏乐观）。
+//
+// 默认关闭，必须显式指定路径 —— 输入法看得见你敲的**一切**，包括密码、
+// 私信、身体状况。这个文件是本机明文，不要放进任何会同步或提交的目录。
+const RECORD_PATH = Deno.env.get("LIME_RECORD");
+
+async function recordCommit(text: string) {
+	if (!RECORD_PATH) return;
+	try {
+		// 句末断行，产出的文件可直接当评测语料喂 LIME_BENCH_TEXT
+		await Deno.writeTextFile(
+			RECORD_PATH,
+			/[。！？\n]$/.test(text) ? `${text}\n` : text,
+			{ append: true },
+		);
+	} catch (e) {
+		console.error("输入记录落盘失败:", e);
+	}
+}
+
 async function learnFromCommit(text: string) {
 	if (!text || text.length > LEARN_MAX_LEN || learnDone.has(text)) return;
 	const n = (commitCount.get(text) ?? 0) + 1;
@@ -211,6 +233,7 @@ api.post("/commit", async (c) => {
 			inputLog.lastKeyTime = null;
 			inputLog.ziCount += text.length;
 			inputLog.history += text;
+			await recordCommit(text);
 			await learnFromCommit(text);
 		}
 		{
