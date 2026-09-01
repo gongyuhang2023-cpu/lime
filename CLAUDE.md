@@ -155,6 +155,24 @@ RIME schema 叫 `llm`，是独立方案，**不能和其他 RIME 方案组合使
 
 **核心指标是 `偏移加权`，不是 `非0偏移占比`。** 后者只说首选中没中，前者才是总选择成本（Σ 偏移×次数）。两者会背离：置信度闸门那一轮，首选命中从 47.1% 升到 50.7%，但选择次数从 333 涨到 353，总成本没变 —— 只看命中率会误判成有效。
 
+## 本机部署现状（2026-09-01）
+
+已在这台 Windows 上真实部署，不只是跑基准：
+
+| 项 | 位置 |
+|---|---|
+| 前端 | 小狼毫 Weasel 0.17.4（winget `Rime.Weasel`） |
+| 方案 | `%APPDATA%\Rime\llm.schema.yaml` + `lua\`，`default.custom.yaml` 挂了 `schema: llm` |
+| 后端启动脚本 | `%LOCALAPPDATA%\LLMKeyboard\start-lime.cmd`（端口 5000） |
+| 开机自启 | 启动文件夹的「LIME 输入法后端.lnk」→ `start-lime-hidden.vbs` → 上面那个 cmd，无窗口 |
+| 输入记录 | `%LOCALAPPDATA%\LLMKeyboard\typing.log`（由启动脚本的 `LIME_RECORD` 开启） |
+
+**`enable_hiae` 已在 lua 里改成 `false`** —— 它每键起两个 deno 进程算加解密，约 128ms，比模型还贵。代价是明文走 127.0.0.1，所以**绝不能把 5000 端口暴露出去**。
+
+写这个 `.cmd` 踩过两个坑，改它时注意：**必须 CRLF 换行 + 纯 ASCII 注释**。用 LF + UTF-8 中文注释时 `cmd.exe` 按 GBK 读，注释乱码会把后面的 `set` 行带崩，表现为 deno 起得来但环境变量没生效。同理 `.vbs` 里别用续行符 `_` 拆链式调用（会报 800A01C2）。
+
+取消自启：删掉启动文件夹里那个快捷方式。停止记录：删掉 `.cmd` 里的 `LIME_RECORD` 那行。
+
 ## 环境约束
 
 - `loadModel()` 里 `getLlama({ gpu: false })` —— **CPU 推理是写死的**（main.ts:64），想上 GPU 要改这里。
