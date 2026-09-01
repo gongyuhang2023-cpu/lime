@@ -564,8 +564,13 @@ export class LIME {
 				}
 			}
 
-			const cacheTokens = sameCache.flatMap((i) => i.token);
-			// todo 下面的判断需要展开
+			// 必须先把用户词的虚拟 token 展开成真实 token：sequence.contextTokens
+			// 里只有真实 token，不展开则长度和内容都对不上 —— 下面的比对会一直
+			// 报「长句缓存不匹配」，而 eraseContextTokenRanges 会按错误的长度
+			// 裁剪，直接破坏上下文。（上游此处的 todo 指的就是这件事。）
+			// 用户词以前分数恒为 0、进不了长句缓存，所以这个 bug 一直没显形；
+			// 给用户词补上真实分数之后，预置 79 个领域词跑一遍基准就报了 590 次。
+			const cacheTokens = this.exTokens(sameCache.flatMap((i) => i.token));
 			if (
 				this.sequence.contextTokens
 					.slice(
