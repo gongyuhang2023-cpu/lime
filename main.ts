@@ -19,6 +19,8 @@ export type Candidate = {
 	remainkeys: string[];
 	preedit: string;
 	consumedkeys: number;
+	/** 该候选来自用户词表（用户显式登记过），排序时同长度优先 */
+	userWord?: boolean;
 };
 
 export type Result = {
@@ -114,7 +116,12 @@ export class LIME {
 	last_context_data = { context: "" };
 	private userTokens = new Map<ExToken, Array<Token>>();
 	private userTokensFirstIndex = new Map<Token, Set<ExToken>>();
+	/** 已登记用户词的 token 序列，用于去重 */
+	private userWordKeys = new Set<string>();
 	private tokenIndex = 0;
+
+	/** 长候选享受长度优先所需的最低每音节置信度；0 = 关闭闸门，等同上游行为 */
+	private longMinConf = Number(Deno.env.get("LIME_LONG_MIN_CONF")) || 0;
 
 	private last_result: Map<ExToken, number> | undefined;
 	/** 长句补全，记录拼音和token对 */
@@ -318,10 +325,7 @@ export class LIME {
 				],
 			]);
 			this.last_result = res.at(-1)?.next.probabilities; // todo 如果在自定义中某个tk值比较大，那尝试多运行一步
-			// 临时
-			for (const i of this.userTokens.keys()) {
-				this.last_result?.set(i, 0);
-			}
+			if (this.last_result) this.applyUserTokenProbs(this.last_result);
 			this.lastCommitOffset = this.sequence.contextTokens.length;
 			release();
 		})();
@@ -335,6 +339,7 @@ export class LIME {
 		await this.modelEvalLock.acquire();
 		this.last_context_data.context = "";
 		this.userTokens.clear();
+		this.userWordKeys.clear();
 		await this.sequence.clearHistory();
 		await this.init_ctx();
 	};
@@ -342,6 +347,22 @@ export class LIME {
 	getEvalResult = async () => {
 		await this.modelEvalLock.acquire();
 		return this.last_result;
+	};
+
+	/**
+	 * 用户词是虚拟 token，模型分布里没有它，上游三处都直接填 0（注释写着「临时」）。
+	 * 代价是任何按概率排序的逻辑对用户词全部失效 —— 实测 addUserWord("冰灯") 之后
+	 * 打 bingdeng，冰灯拿着 score 0 输给了 score 0.5 的「并等」。
+	 *
+	 * 这里改用首个真实 token 的概率作为估计：用户词的后续字是用户亲自登记过的，
+	 * 把不确定性压在首字上是合理近似，而且不需要额外前向。填进 last_result 后
+	 * 会和其他候选一起过 filterByPinyin 的归一化，量纲自然对齐。
+	 */
+	private applyUserTokenProbs = (r: Map<ExToken, number>) => {
+		for (const [id, ts] of this.userTokens) {
+			const head = ts[0];
+			r.set(id, head === undefined ? 0 : (r.get(head) ?? 0));
+		}
 	};
 
 	exTokens = (tokens: ExToken[]) => {
@@ -362,13 +383,13 @@ export class LIME {
 		return true;
 	};
 
-	addUserWord = (w: string) => {
-		const ts = this.model.tokenizer(w);
-		if (ts.length === 0) return false;
-
-		const token_id = this.tokenIndex++;
-
+	/**
+	 * 把一个虚拟 token 注册进各张索引。addUserWord 与 loadUserData 共用：
+	 * 只往 userTokens 里塞映射是不够的，不建拼音索引的话这个词永远不会进候选集。
+	 */
+	private registerUserToken = (token_id: ExToken, ts: Array<Token>) => {
 		this.userTokens.set(token_id, ts);
+		this.userWordKeys.add(ts.join(","));
 
 		const findex = this.userTokensFirstIndex.get(ts[0]) ?? new Set();
 		findex.add(token_id);
@@ -384,8 +405,19 @@ export class LIME {
 		}
 
 		if (this.last_result) {
-			this.last_result.set(token_id, 0);
+			this.last_result.set(token_id, this.last_result.get(ts[0]) ?? 0);
 		}
+	};
+
+	addUserWord = (w: string) => {
+		const ts = this.model.tokenizer(w);
+		if (ts.length === 0) return false;
+
+		// 上游把去重交给调用方（checkAddUserWord 的注释），但重复登记会生成两个
+		// 虚拟 token，候选里就会出现两个一模一样的词。这里按 token 序列兜底。
+		if (this.userWordKeys.has(ts.join(","))) return false;
+
+		this.registerUserToken(this.tokenIndex++, ts);
 
 		return true;
 	};
@@ -594,7 +626,7 @@ export class LIME {
 							],
 						])
 					).at(-1)?.next.probabilities || new Map<ExToken, number>(); // todo
-				for (const ntk of this.userTokens.keys()) r.set(ntk, 0);
+				this.applyUserTokenProbs(r);
 				return r;
 			};
 
@@ -654,7 +686,7 @@ export class LIME {
 
 		// 常规
 		for (const [
-			_,
+			token_id,
 			{ py: token_pinyin, prob: token_prob, token },
 		] of new_last_result) {
 			const rmpy = pinyin_input.slice(token_pinyin.length).map((v) => v[0].ind);
@@ -667,6 +699,7 @@ export class LIME {
 					token_pinyin.map((v) => v.preeditShow).join(" ") +
 					(rmpy.length ? " " : ""),
 				consumedkeys: token_pinyin.map((v) => v.key).join("").length,
+				userWord: this.userTokens.has(token_id),
 			});
 		}
 
@@ -686,7 +719,25 @@ export class LIME {
 			}
 		}
 
-		c.sort((a, b) => b.pinyin.length - a.pinyin.length);
+		// 长词优先，但长候选必须先过置信度闸门。
+		// 上游此处只按拼音长度排序、完全忽略 score，于是模型硬凑出来的低概率长句
+		// 只要音节最多就排第一（实测最惨一例：首选是一整句错话，正确答案被挤到第 55 位；
+		// 偏移 >=10 的事件只占 1.2% 的选择，却贡献了 26% 的选择成本）。
+		// score 是联合概率，随长度指数衰减，长短候选之间不可直接比大小，
+		// 故取长度归一化的几何平均，即「每音节平均置信度」。
+		const effLen = (x: Candidate) => {
+			if (x.pinyin.length <= 1 || this.longMinConf <= 0) return x.pinyin.length;
+			return x.score ** (1 / x.pinyin.length) >= this.longMinConf
+				? x.pinyin.length
+				: 1;
+		};
+		// 同等长度时，用户显式登记过的词优先于模型即兴拼出来的同音串。
+		// 这正是用户词典的语义；批量导入词库时它们彼此之间再按上面的概率排序。
+		c.sort(
+			(a, b) =>
+				effLen(b) - effLen(a) ||
+				Number(b.userWord ?? false) - Number(a.userWord ?? false),
+		);
 		let tc = c;
 		for (const f of this.afterReSort) {
 			tc = f(tc);
@@ -734,15 +785,48 @@ export class LIME {
 			})),
 		} as UserData;
 	};
-	loadUserData = (data: UserData) => {
+	/**
+	 * 恢复 getUserData() 导出的数据。
+	 *
+	 * 「记忆」是两层，恢复难度差一个量级：
+	 *  - 用户词：纯数据，重建索引即可（registerUserToken）。
+	 *  - 上下文：是 llama.cpp 的 KV cache，属于模型中间状态、不是数据，
+	 *    只能把 token 序列重新喂一遍让它重建。长度受 contextSize 限制，
+	 *    超出部分由既有的 tryOmitContext 裁掉。
+	 */
+	loadUserData = async (data: UserData) => {
 		if (this.userTokens.size > 0) {
 			console.log("已存在用户数据");
 			return;
 		}
-		// todo
-		this.userTokens.clear();
-		for (const [k, v] of Object.entries(data.words))
-			this.userTokens.set(Number(k), v as Token[]);
+		for (const [k, v] of Object.entries(data.words)) {
+			const id = Number(k);
+			this.registerUserToken(id, v as Token[]);
+			// 虚拟 id 必须跳过已恢复的，否则下一个 addUserWord 会复用 id 覆盖掉旧词
+			this.tokenIndex = Math.max(this.tokenIndex, id + 1);
+		}
+
+		const tokens = data.context.map((i) => i.token);
+		const last = tokens.at(-1);
+		if (last === undefined) return;
+
+		await this.modelEvalLock.acquire();
+		const { release } = await this.modelEvalLock.lock();
+		try {
+			await this.sequence.clearHistory();
+			const res = await this.sequence.controlledEvaluate([
+				...tokens.slice(0, -1),
+				[last, { generateNext: { probabilities: true, options: { topK: Infinity } } }],
+			]);
+			this.last_result = res.at(-1)?.next.probabilities;
+			if (this.last_result) this.applyUserTokenProbs(this.last_result);
+			this.lastCommitOffset = this.sequence.contextTokens.length;
+		} finally {
+			release();
+		}
+		console.log(
+			`恢复用户数据：${this.userTokens.size} 个用户词，${tokens.length} 个上下文 token`,
+		);
 	};
 }
 
