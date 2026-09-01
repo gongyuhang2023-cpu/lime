@@ -11,6 +11,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const config: Config = {
 	runner: await initLIME({
 		ziInd: load_pinyin(),
+		// 上游默认 0.6B。实测同为 IQ4_XS 量化时，1.7B 把总选择成本降了 32%
+		// （偏移加权 575→391），首选命中率 38.5%→47.1%，故本 fork 默认用 1.7B。
+		// 换回 0.6B 或换别的模型：复制本文件为 user_config.ts 后改这一行。
+		modelPath: path.join(
+			__dirname,
+			"../Qwen3-1.7B-GGUF/Qwen3-1.7B-IQ4_XS.gguf",
+		),
 		omitContext: true,
 		afterReSort: [
 			resortFeq(

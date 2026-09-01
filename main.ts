@@ -63,9 +63,10 @@ export async function loadModel(op?: {
 		path.join(__dirname, "../Qwen3-0.6B-GGUF/Qwen3-0.6B-IQ4_XS.gguf");
 
 	const llama = await getLlama({
-		// LIME_GPU=1 时交给 node-llama-cpp 自动选后端（cuda/vulkan）
-		// 不设则维持上游默认的纯 CPU 推理，行为不变
-		gpu: Deno.env.get("LIME_GPU") ? "auto" : false,
+		// 上游写死 gpu:false。实测 RTX 5070 上走 Vulkan，基准耗时从约 40 分钟
+		// 降到约 10 分钟，故本 fork 默认交给 node-llama-cpp 自动选后端
+		//（无可用 GPU 时它会自己退回 CPU）。LIME_GPU=0 可强制纯 CPU。
+		gpu: Deno.env.get("LIME_GPU") === "0" ? false : "auto",
 	});
 
 	console.log("加载模型", modelPath);
@@ -120,8 +121,11 @@ export class LIME {
 	private userWordKeys = new Set<string>();
 	private tokenIndex = 0;
 
-	/** 长候选享受长度优先所需的最低每音节置信度；0 = 关闭闸门，等同上游行为 */
-	private longMinConf = Number(Deno.env.get("LIME_LONG_MIN_CONF")) || 0;
+	/**
+	 * 候选表头部最多允许几个长候选，之后让位给短候选；0 = 不限制（上游行为）。
+	 * 默认 3：实测 3 优于 5，总选择成本（偏移加权）从 391 降到 364。
+	 */
+	private longHead = Number(Deno.env.get("LIME_LONG_HEAD") ?? 3) || 0;
 
 	private last_result: Map<ExToken, number> | undefined;
 	/** 长句补全，记录拼音和token对 */
@@ -719,26 +723,36 @@ export class LIME {
 			}
 		}
 
-		// 长词优先，但长候选必须先过置信度闸门。
-		// 上游此处只按拼音长度排序、完全忽略 score，于是模型硬凑出来的低概率长句
-		// 只要音节最多就排第一（实测最惨一例：首选是一整句错话，正确答案被挤到第 55 位；
-		// 偏移 >=10 的事件只占 1.2% 的选择，却贡献了 26% 的选择成本）。
-		// score 是联合概率，随长度指数衰减，长短候选之间不可直接比大小，
-		// 故取长度归一化的几何平均，即「每音节平均置信度」。
-		const effLen = (x: Candidate) => {
-			if (x.pinyin.length <= 1 || this.longMinConf <= 0) return x.pinyin.length;
-			return x.score ** (1 / x.pinyin.length) >= this.longMinConf
-				? x.pinyin.length
-				: 1;
-		};
-		// 同等长度时，用户显式登记过的词优先于模型即兴拼出来的同音串。
-		// 这正是用户词典的语义；批量导入词库时它们彼此之间再按上面的概率排序。
+		// 长词优先；同等长度时，用户显式登记过的词优先于模型即兴拼出的同音串
+		// —— 这是用户词典本来的语义，批量导入词库时它们彼此之间再按概率排序。
 		c.sort(
 			(a, b) =>
-				effLen(b) - effLen(a) ||
+				b.pinyin.length - a.pinyin.length ||
 				Number(b.userWord ?? false) - Number(a.userWord ?? false),
 		);
+
+		// 长候选的首屏配额。
+		//
+		// 上游只按拼音长度排序，于是敲一整句拼音时，候选表头部会被一大串等长的
+		// 错误整句猜测占满，正确的短词被挤到很后面 —— 实测最惨一例，正确的单字
+		// 排在第 54 位（page_size 5，等于翻 11 页）。
+		//
+		// 先试过给长候选设「每音节平均置信度」闸门，无效：那些垃圾长句的置信度
+		// 高于 0.65，模型不是不自信，是自信地错，这个杠杆撬不动它。
+		// 改为限制头部允许多少个长候选，保证短候选在首屏就拿得到，
+		// 把猜错时的代价从翻十几页压到翻一页。
 		let tc = c;
+		if (this.longHead > 0) {
+			const long = c.filter((x) => x.pinyin.length > 1);
+			if (long.length > this.longHead) {
+				tc = long
+					.slice(0, this.longHead)
+					.concat(
+						c.filter((x) => x.pinyin.length <= 1),
+						long.slice(this.longHead),
+					);
+			}
+		}
 		for (const f of this.afterReSort) {
 			tc = f(tc);
 		}
