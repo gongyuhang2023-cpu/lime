@@ -48,10 +48,22 @@ async function run() {
 	// LIME_BENCH_MODEL / LIME_BENCH_TEXT 用于横向对比不同模型、不同语料
 	// 都不设时行为与上游一致（默认模型 + 冰灯.txt）
 	const modelPath = Deno.env.get("LIME_BENCH_MODEL");
-	const { commit, single_ci } = await initLIME({
+	const { commit, single_ci, addUserWord } = await initLIME({
 		ziInd: load_pinyin(),
 		...(modelPath ? { modelPath } : {}),
 	});
+
+	// LIME_BENCH_USERWORDS：一行一个词，用于评测「预置领域词库」的效果
+	const userWordsFile = Deno.env.get("LIME_BENCH_USERWORDS");
+	if (userWordsFile) {
+		const ws = Deno.readTextFileSync(userWordsFile)
+			.split("\n")
+			.map((w) => w.trim())
+			.filter(Boolean);
+		let ok = 0;
+		for (const w of ws) if (addUserWord(w)) ok++;
+		console.log(`预置用户词 ${ok}/${ws.length}`);
+	}
 
 	const file =
 		Deno.env.get("LIME_BENCH_TEXT") ?? path.join(__dirname, "冰灯.txt");

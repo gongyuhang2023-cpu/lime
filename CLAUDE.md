@@ -34,8 +34,9 @@ deno test -A test/test_user_word.ts
 deno test -A test/test_user_word.ts --filter "组词"   # 单个测试
 deno test -A test/                                    # 全部
 
-# 打字速度/排序质量基准（长句灌拼音，统计按键数、候选查找耗时）
-deno run -A test/test_text.ts
+# 打字速度/排序质量基准
+LIME_GPU=1 LIME_BENCH_MODEL=<gguf> LIME_BENCH_TEXT=<txt> deno run -A test/test_text.ts
+deno run -A test/test_text.ts cal 400        # 把上一轮结果换算成理论 cpm
 
 # 批量导入 RIME 词库为用户词（按词频 >5000 过滤，写入 userword/preload_word.txt）
 deno run -A userword/preload_word.ts rime <rime词库.dict.yaml路径>
@@ -63,28 +64,34 @@ deno run install_interface && deno run build_interface
 
 `checkAddUserWord()` 会拒绝两类词：tokenize 后只有 1 个 token 的（模型自己就能预测），以及含无拼音映射 token 的。
 
-### ⚠️ 已知设计缺口：用户词的模型概率恒为 0
+### 用户词打分（本 fork 已修）
 
-三处硬编码置零：
+上游把用户词的模型概率三处硬编码为 0（注释都写着「临时」），导致按概率排序的逻辑对用户词全部失效，上游自带的 `组词` 测试在 master 上是红的。
 
-- `main.ts:333` —— `addUserWord` 新增时置 0
-- `main.ts:320` —— `commit` 后置 0
-- `main.ts:594` —— `addToken()` 每次重算分布后置 0
+现在：`applyUserTokenProbs()` 取首个真实 token 的概率作为估计，填进 `last_result` 后与其他候选一起过归一化。排序上，`Candidate.userWord` 标记让同等长度的用户词优先于模型即兴拼出的同音串 —— 这是用户词典本来的语义（实测冰灯概率 0.0028 远低于并等 0.466，是这一层让它赢的，光靠概率赢不了）。
 
-**后果**：用户词是「白名单」不是「高分词」。它进得了候选池，但排名靠「长词优先」启发式和 `config.ts` 里 `afterReSort` 的 `resortFeq`（一张 top2500 常用字频率表）决定，**与上下文无关**。
+`addUserWord` 按 token 序列去重；`registerUserToken` 是 `addUserWord` / `loadUserData` 共用的注册入口，**只往 `userTokens` 塞映射而不建拼音索引的话，这个词永远不会进候选集**。
 
-正确做法是给虚拟 token 算展开后的真实联合概率 `P(t1)·P(t2|t1)·…`。`addToken()`（main.ts:578）已经在做 ExToken 展开求值，只是算完把结果丢了填了 0。改动要配剪枝（只给 top-N 候选算），否则每个候选一次前向扛不住。
-
-### 持久化现状
+### 持久化
 
 | 环节 | 状态 |
 |---|---|
-| 导出 | `getUserData()` (main.ts:726) + `GET /api/userdata`，返回 `{words, context}` |
-| 导入 | `loadUserData()` (main.ts:735) 是 `// todo`，只恢复 `words`，**`context` 完全没恢复** |
+| 导出 | `getUserData()` + `GET /api/userdata`，返回 `{words, context}` |
+| 导入 | `loadUserData()` 本 fork 已实现（含索引重建、`tokenIndex` 推进、上下文重放），有往返测试 |
 | 启动加载 | `server.ts:64` 读 `config.userWordsPath` 纯文本词表，逐行 `addUserWord()` |
-| 自动落盘 | **不存在** |
+| 自动落盘 | **仍不存在** —— 这是剩下的活 |
 
-注意「记忆」是两层，持久化难度差一个量级：**用户词**（`userTokens`，纯数据，重放 `addUserWord` 即可）vs **上下文**（`sequence.contextTokens` + llama.cpp 的 KV cache，是模型中间状态，只能存文本重新 prefill，且必须配滚动窗口）。
+「记忆」是两层，难度差一个量级：**用户词**（纯数据，重建索引即可）vs **上下文**（`sequence.contextTokens` + llama.cpp 的 KV cache，是模型中间状态，只能把 token 序列重新喂一遍，长度受 `contextSize` 限制）。
+
+### 候选排序与长句
+
+最终排序在 `single_ci` 末尾：按拼音长度降序，用户词同长度优先，再过 `afterReSort`（`config.ts` 里挂了 `resortFeq`，一张 top2500 常用字频率表）。
+
+**上游只按长度排序、完全忽略 `score`。** 敲一整句拼音时，候选表头部会被一串等长的错误整句猜测占满，正确的短词被挤到很后面（实测最惨一例：正确单字排第 54 位，`page_size` 是 5，等于翻 11 页）。
+
+`LIME_LONG_HEAD` 限制头部允许几个长候选，之后让位给短候选。
+
+**已否定的方案**：给长候选设「每音节平均置信度」闸门无效。扫过 0.35 / 0.50 / 0.65 三档，首选命中率只从 47.1% 升到 50.7%，但选择次数从 333 涨到 353，总成本（偏移加权）持平，长尾（54/22/13/12）**四档完全不变**。原因是那些垃圾长句的置信度高于 0.65 —— 模型不是不自信，是自信地错。别再往这个方向试。
 
 ### 上下文窗口管理
 
@@ -99,6 +106,12 @@ deno run install_interface && deno run build_interface
 Deno + Hono HTTP 服务器，RIME 前端（`rime/lua/llm_pinyin.lua`）通过 shell 调 `curl` 请求 `/candidates` 和 `/commit`；开了 HiAE 加密时还会 shell 调 `deno run hiae_payload.ts`。**所有按键都流经 localhost HTTP**，别把端口暴露出去。
 
 RIME schema 叫 `llm`，是独立方案，**不能和其他 RIME 方案组合使用**。
+
+### 读基准数字前必须知道的两件事
+
+**它测的是最难的输入方式。** `test_text.ts` 用 `Intl.Segmenter` 切词后，会把连续的词块**累积到标点为止**才作为一个输入单元 —— 也就是「敲完一整个小句的拼音再选字」，不是逐词上屏。所以偏移数字比日常逐词输入要难看。
+
+**核心指标是 `偏移加权`，不是 `非0偏移占比`。** 后者只说首选中没中，前者才是总选择成本（Σ 偏移×次数）。两者会背离：置信度闸门那一轮，首选命中从 47.1% 升到 50.7%，但选择次数从 333 涨到 353，总成本没变 —— 只看命中率会误判成有效。
 
 ## 环境约束
 
